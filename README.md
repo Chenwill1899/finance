@@ -33,6 +33,7 @@ macOS 用户可直接双击 `start.command`。
 |---|---|
 | `analyzer_app.py` | 本地 Web App（UI + 进程内数据引擎 + 缓存/并发 + 提醒）|
 | `stock_data_fetcher.py` | 数据获取 + 技术指标计算引擎（可单独 CLI 使用）|
+| `backtest_engine.py` | 回测引擎：用历史数据验证评分规则（含费用/ATR止损/对比基准）|
 | `test_indicators.py` | 指标算法单元测试（`python3 test_indicators.py`）|
 | `requirements.txt` | 依赖清单 |
 | `start.command` | macOS 一键启动 |
@@ -52,6 +53,16 @@ python3 stock_data_fetcher.py --stocks "NVDA,MU,RKLB" --days 120 --extras
 ```bash
 python3 test_indicators.py
 ```
+
+## 📉 回测（验证规则是否赚钱）
+
+```bash
+python3 backtest_engine.py --stocks "NVDA,MU,RKLB" --days 400   # 真实历史回测
+python3 backtest_engine.py --selftest                           # 合成数据自测（不联网）
+```
+
+无前视偏差（当日出信号、次日执行）、含手续费/滑点与 ATR 止损，输出年化、最大回撤、夏普、胜率、盈亏比，并与买入持有对比。
+> 样本内表现 ≠ 实盘，下一步应做 walk-forward 验证（见路线图）。
 
 ## 🗺️ 路线图
 
