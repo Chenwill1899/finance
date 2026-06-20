@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Stock Data Fetcher + Technical Indicator Calculator
+US Stock Data Fetcher + Technical Indicator Calculator
 Outputs structured JSON for Claude Code analysis.
 No AI/LLM calls -- pure data + math.
 
-Data source priority (graceful degradation):
+Primary data source:
+  US:      yfinance
+
+Legacy non-US fetchers are still present internally, but the local web app is US-only.
+
+Legacy data source priority (graceful degradation):
   A-share: Tushare Pro (if TUSHARE_TOKEN set) > efinance > akshare > yfinance
   HK:      efinance > akshare > yfinance
-  US:      yfinance (primary)
 
 News search priority (via --news flag):
   Tavily (if TAVILY_API_KEY set) > SerpAPI (if SERPAPI_KEY set) > skip (use WebSearch in Claude)
 
 Usage:
-    python3 stock_data_fetcher.py --stocks "600519,TSLA,HK00700" [--days 120] [--news]
+    python3 stock_data_fetcher.py --stocks "NVDA,RDW,RKLB" [--days 120] [--extras]
 
 Environment variables (optional, for enhanced data):
     TUSHARE_TOKEN    - Tushare Pro token (free signup at tushare.pro)
@@ -26,12 +30,19 @@ import sys
 import json
 import argparse
 import warnings
+import time
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from html import unescape
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 
 warnings.filterwarnings("ignore")
 
 # Data source availability detection
 _AVAILABLE_SOURCES = {}
+_BENCHMARK_CACHE = {}
 
 def _check_source(name):
     """Lazy-check if a data source library is importable."""
@@ -456,6 +467,128 @@ def fetch_us(code: str, days: int) -> dict:
 # SECTION 2.5: News Search (optional, with graceful degradation)
 # ============================================================
 
+NEWS_POSITIVE_KEYWORDS = (
+    "beat", "beats", "contract", "wins", "won", "award", "awarded",
+    "guidance raised", "raises guidance", "raised guidance", "upgrade",
+    "upgraded", "partnership", "launch", "record revenue", "profit",
+    "profitable", "buy rating", "outperform", "price target raised",
+)
+NEWS_NEGATIVE_KEYWORDS = (
+    "offering", "dilution", "dilutive", "downgrade", "downgraded",
+    "miss", "misses", "guidance cut", "cuts guidance", "lawsuit",
+    "investigation", "probe", "sec", "short seller", "bankruptcy",
+    "delisting", "delist", "recall", "layoffs", "loss widens",
+)
+NEWS_RISK_KEYWORDS = (
+    "earnings", "results", "fda", "trial", "approval",
+    "merger", "acquisition", "offering", "bankruptcy", "sec",
+    "short seller", "analyst", "volatility", "lawsuit", "investigation",
+)
+
+
+def build_google_news_rss_url(code: str, company_name: str = "") -> str:
+    """Build a Google News RSS query URL for a US ticker."""
+    terms = [code.strip().upper(), "stock"]
+    if company_name and company_name.upper() != code.strip().upper():
+        terms.insert(1, company_name.strip())
+    query = " ".join(t for t in terms if t)
+    return f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+
+
+def parse_google_news_rss(xml_text: str, max_results: int = 5) -> list:
+    """Parse Google News RSS XML into the app's news item shape."""
+    root = ET.fromstring(xml_text)
+    items = []
+    for item in root.findall(".//item")[:max_results]:
+        title = unescape((item.findtext("title") or "").strip())
+        link = unescape((item.findtext("link") or "").strip())
+        publisher = unescape((item.findtext("source") or "").strip())
+        pub_raw = (item.findtext("pubDate") or "").strip()
+        published_at = ""
+        if pub_raw:
+            try:
+                published_at = parsedate_to_datetime(pub_raw).isoformat()
+            except Exception:
+                published_at = pub_raw
+        if title:
+            items.append({
+                "title": title,
+                "url": link,
+                "publisher": publisher,
+                "published_at": published_at,
+                "source": "google_news",
+            })
+    return items
+
+
+def _has_any_keyword(text: str, keywords: tuple) -> bool:
+    text_l = text.lower()
+    return any(k in text_l for k in keywords)
+
+
+def analyze_news_sentiment(news_items: list) -> dict:
+    """Lightweight title-based news interpretation for trading context."""
+    if not news_items:
+        return {
+            "tone": "none",
+            "positive_count": 0,
+            "negative_count": 0,
+            "risk_count": 0,
+            "summary_cn": "暂无可用新闻。",
+            "positive_hits": [],
+            "negative_hits": [],
+            "risk_hits": [],
+        }
+
+    positive_hits, negative_hits, risk_hits = [], [], []
+    for item in news_items:
+        title = str(item.get("title") or "")
+        content = str(item.get("content") or "")
+        text = f"{title} {content}"
+        if _has_any_keyword(text, NEWS_POSITIVE_KEYWORDS):
+            positive_hits.append(title)
+        if _has_any_keyword(text, NEWS_NEGATIVE_KEYWORDS):
+            negative_hits.append(title)
+        if _has_any_keyword(text, NEWS_RISK_KEYWORDS):
+            risk_hits.append(title)
+
+    pos, neg, risk = len(positive_hits), len(negative_hits), len(risk_hits)
+    if pos and neg:
+        tone = "mixed"
+        summary = "消息面多空交织，技术信号需要等价格确认。"
+    elif neg:
+        tone = "negative"
+        summary = "消息面偏负面，买入信号应降级为谨慎观察。"
+    elif pos:
+        tone = "positive"
+        summary = "消息面偏正面，可作为技术信号的辅助确认。"
+    else:
+        tone = "neutral"
+        summary = "新闻未识别出明显利好或利空。"
+    if risk:
+        summary += f" 近期有 {risk} 条高波动相关新闻，建议控制仓位。"
+
+    return {
+        "tone": tone,
+        "positive_count": pos,
+        "negative_count": neg,
+        "risk_count": risk,
+        "summary_cn": summary,
+        "positive_hits": positive_hits[:3],
+        "negative_hits": negative_hits[:3],
+        "risk_hits": risk_hits[:3],
+    }
+
+
+def fetch_google_news(code: str, company_name: str = "", max_results: int = 5) -> list:
+    """Fetch recent ticker news from Google News RSS without an API key."""
+    url = build_google_news_rss_url(code, company_name)
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=8) as resp:
+        xml_text = resp.read().decode("utf-8", errors="replace")
+    return parse_google_news_rss(xml_text, max_results=max_results)
+
+
 def search_news(stock_name: str, code: str, max_results: int = 5) -> list:
     """
     Search news with priority: Tavily > SerpAPI > empty (let Claude WebSearch).
@@ -814,9 +947,103 @@ def calc_weekly(ohlcv: list) -> dict:
             "ma": {k: ma.get(k) for k in ("MA5", "MA10", "MA20")}, "weeks": len(closes)}
 
 
-def fetch_us_extras(code: str, want_news: bool = True) -> dict:
+def _return_pct(ohlcv: list, period: int):
+    closes = [b.get("close") for b in ohlcv if b.get("close") is not None]
+    if len(closes) < period + 1:
+        return None
+    start = closes[-period - 1]
+    end = closes[-1]
+    if not start:
+        return None
+    return round((end - start) / start * 100, 2)
+
+
+def _relative_bucket(value, threshold=2.0):
+    if value is None:
+        return "unknown"
+    if value >= threshold:
+        return "outperform"
+    if value <= -threshold:
+        return "underperform"
+    return "neutral"
+
+
+def calc_relative_strength(stock_ohlcv: list, benchmarks: dict, periods=(5, 20, 60)) -> dict:
+    """Compare a stock's returns with SPY/QQQ over multiple lookback windows."""
+    out = {"periods": {}, "summary": {
+        "market": "unknown",
+        "tech": "unknown",
+        "label_cn": "相对强弱数据不足",
+    }}
+    for period in periods:
+        key = f"{period}d"
+        stock_ret = _return_pct(stock_ohlcv, period)
+        spy_ret = _return_pct(benchmarks.get("SPY", []), period)
+        qqq_ret = _return_pct(benchmarks.get("QQQ", []), period)
+        vs_spy = round(stock_ret - spy_ret, 2) if stock_ret is not None and spy_ret is not None else None
+        vs_qqq = round(stock_ret - qqq_ret, 2) if stock_ret is not None and qqq_ret is not None else None
+        out["periods"][key] = {
+            "stock_return": stock_ret,
+            "spy_return": spy_ret,
+            "qqq_return": qqq_ret,
+            "vs_spy": vs_spy,
+            "vs_qqq": vs_qqq,
+        }
+
+    preferred = {}
+    for key in ("20d", "5d", "60d"):
+        row = out["periods"].get(key) or {}
+        if row.get("vs_spy") is not None or row.get("vs_qqq") is not None:
+            preferred = row
+            break
+    market = _relative_bucket(preferred.get("vs_spy"))
+    tech = _relative_bucket(preferred.get("vs_qqq"))
+    label_map = {
+        ("outperform", "outperform"): "强于大盘和科技指数",
+        ("outperform", "neutral"): "强于大盘",
+        ("outperform", "unknown"): "强于大盘",
+        ("neutral", "outperform"): "强于科技指数",
+        ("unknown", "outperform"): "强于科技指数",
+        ("underperform", "underperform"): "弱于大盘和科技指数",
+        ("underperform", "neutral"): "弱于大盘",
+        ("underperform", "unknown"): "弱于大盘",
+        ("neutral", "underperform"): "弱于科技指数",
+        ("unknown", "underperform"): "弱于科技指数",
+        ("outperform", "underperform"): "强于大盘但弱于科技指数",
+        ("underperform", "outperform"): "弱于大盘但强于科技指数",
+        ("neutral", "neutral"): "相对强弱中性",
+        ("neutral", "unknown"): "相对大盘中性",
+        ("unknown", "neutral"): "相对科技指数中性",
+    }
+    out["summary"] = {
+        "market": market,
+        "tech": tech,
+        "label_cn": label_map.get((market, tech), "相对强弱数据不足"),
+    }
+    return out
+
+
+def fetch_us_benchmarks(days: int = 120) -> dict:
+    """Fetch SPY/QQQ OHLCV with a small in-process cache."""
+    now = time.time()
+    out = {}
+    for symbol in ("SPY", "QQQ"):
+        hit = _BENCHMARK_CACHE.get(symbol)
+        if hit and hit["days"] >= days and now - hit["ts"] < 300:
+            out[symbol] = hit["ohlcv"]
+            continue
+        try:
+            ohlcv, _source = _fetch_yfinance(symbol, "us", days)
+            _BENCHMARK_CACHE[symbol] = {"ts": now, "days": days, "ohlcv": ohlcv}
+            out[symbol] = ohlcv
+        except Exception as e:
+            _log(f"[{symbol}] Benchmark fetch failed: {e}")
+    return out
+
+
+def fetch_us_extras(code: str, company_name: str = "", want_news: bool = True) -> dict:
     """美股额外上下文：财报日 + 新闻（走 yfinance，免 API Key）。"""
-    out = {"earnings_date": None, "days_to_earnings": None, "news": []}
+    out = {"earnings_date": None, "days_to_earnings": None, "news": [], "news_sentiment": None}
     try:
         import yfinance as yf
         from datetime import datetime as _now
@@ -839,21 +1066,27 @@ def fetch_us_extras(code: str, want_news: bool = True) -> dict:
                     pass
         except Exception:
             pass
-        # --- 新闻（兼容新旧 schema）---
+        # --- 新闻：优先 Google News RSS，无 API Key；失败则回退 yfinance ---
         if want_news:
             try:
-                for n in (t.news or [])[:4]:
-                    c = n.get("content") if isinstance(n.get("content"), dict) else None
-                    if c:
-                        title = c.get("title")
-                        link = (c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
-                        pub = (c.get("provider") or {}).get("displayName")
-                    else:
-                        title, link, pub = n.get("title"), n.get("link"), n.get("publisher")
-                    if title:
-                        out["news"].append({"title": title, "url": link or "", "publisher": pub or ""})
+                out["news"] = fetch_google_news(code, company_name or code, max_results=5)
+            except Exception as e:
+                _log(f"[{code}] Google News failed: {e}")
+            try:
+                if not out["news"]:
+                    for n in (t.news or [])[:4]:
+                        c = n.get("content") if isinstance(n.get("content"), dict) else None
+                        if c:
+                            title = c.get("title")
+                            link = (c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+                            pub = (c.get("provider") or {}).get("displayName")
+                        else:
+                            title, link, pub = n.get("title"), n.get("link"), n.get("publisher")
+                        if title:
+                            out["news"].append({"title": title, "url": link or "", "publisher": pub or "", "source": "yfinance"})
             except Exception:
                 pass
+        out["news_sentiment"] = analyze_news_sentiment(out["news"])
     except Exception:
         pass
     return out
@@ -1037,16 +1270,20 @@ def analyze_stock(code: str, days: int = 120, fetch_news: bool = False, extras: 
         "fetch_time": datetime.now().isoformat(),
     }
 
-    # 财报日 + 免费新闻（美股，走 yfinance）
+    # 财报日 + 免费新闻 + 相对强弱（美股额外上下文）
     if extras and market == "us":
-        ex = fetch_us_extras(display, want_news=not news)
+        ex = fetch_us_extras(display, raw.get("name", display), want_news=not news)
         if ex.get("earnings_date"):
             result["earnings"] = {"date": ex["earnings_date"], "days": ex["days_to_earnings"]}
         if not news and ex.get("news"):
             news = ex["news"]
+        benchmarks = fetch_us_benchmarks(max(days, 120))
+        if benchmarks:
+            result["relative_strength"] = calc_relative_strength(ohlcv, benchmarks)
 
     if news:
         result["news"] = news
+        result["news_sentiment"] = analyze_news_sentiment(news)
     return result
 
 

@@ -13,11 +13,42 @@
 """
 import sys
 import os
+import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 USAGE = __doc__
+
+
+def _load_module(path):
+    name = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_tests():
+    test_files = sorted(
+        os.path.join(HERE, name)
+        for name in os.listdir(HERE)
+        if name.startswith("test_") and name.endswith(".py")
+    )
+    total = 0
+    for path in test_files:
+        mod = _load_module(path)
+        tests = [
+            v for k, v in sorted(vars(mod).items())
+            if k.startswith("test_") and callable(v)
+        ]
+        if not tests:
+            continue
+        print(f"\n▶ {os.path.basename(path)}")
+        for test in tests:
+            test()
+        total += len(tests)
+    print(f"\n全部 {total} 项测试通过 ✅")
 
 
 def main():
@@ -40,11 +71,7 @@ def main():
         stock_data_fetcher.main()
 
     elif cmd in ("test", "tests"):
-        import test_indicators as ti
-        tests = [v for k, v in sorted(vars(ti).items()) if k.startswith("test_") and callable(v)]
-        for t in tests:
-            t()
-        print(f"\n全部 {len(tests)} 项测试通过 ✅")
+        _run_tests()
 
     elif cmd in ("help", "-h", "--help"):
         print(USAGE)

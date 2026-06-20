@@ -40,6 +40,52 @@ try:
 except Exception as _e:
     print(f"⚠️  无法导入回测引擎：{_e}")
 
+US_ONLY_ERROR = "目前仅支持美股 ticker，例如 NVDA、RDW、RKLB。"
+
+
+def is_simple_us_ticker(code):
+    """Return True for the app's supported US ticker shape."""
+    c = (code or "").strip().upper()
+    return c.isalpha() and 1 <= len(c) <= 5
+
+
+def split_us_tickers(raw):
+    """Split user/API input into supported US tickers and rejected items."""
+    valid, errors = [], []
+    seen = set()
+    for item in (raw or "").replace("\n", ",").split(","):
+        code = item.strip().upper()
+        if not code:
+            continue
+        if is_simple_us_ticker(code):
+            if code not in seen:
+                valid.append(code)
+                seen.add(code)
+        else:
+            errors.append({"code": code, "error": US_ONLY_ERROR})
+    return valid, errors
+
+
+def _analysis_error_response(errors, engine="in-process"):
+    return {
+        "analysis_date": datetime.now().strftime("%Y-%m-%d"),
+        "analysis_time": datetime.now().strftime("%H:%M:%S"),
+        "stocks": [],
+        "errors": errors,
+        "total_requested": len(errors),
+        "total_success": 0,
+        "engine": engine,
+    }
+
+
+def _merge_input_errors(data, input_errors):
+    if not input_errors:
+        return data
+    merged = dict(data)
+    merged["errors"] = input_errors + list(data.get("errors", []))
+    merged["total_requested"] = data.get("total_requested", 0) + len(input_errors)
+    return merged
+
 
 def _fetch_ohlcv(code, days):
     """按市场拉取日线（给回测用）。"""
@@ -209,16 +255,16 @@ button.ghost,.close,.histclear{background:rgba(255,255,255,.62)!important;color:
 .bigchart2{height:240px;position:relative;margin:4px 0 14px}
 </style></head><body><div class="wrap">
 <h1>📈 美股智能分析看板</h1>
-<p class="lede">输入股票代码，点「分析」——自动跑脚本、画图、算指标、给买卖意见。数据来自 Yahoo Finance 实时拉取。</p>
+<p class="lede">输入美股 ticker，点「分析」——自动拉行情、抓新闻、算指标、给买卖意见。行情来自 Yahoo Finance，新闻来自 Google News / yfinance。</p>
 <div class="panel">
   <div class="row">
-    <input id="tickers" type="text" placeholder="NVDA@200, MU, RKLB" value=""
+    <input id="tickers" type="text" placeholder="NVDA@200, RDW, RKLB" value=""
       onkeydown="if(event.key==='Enter')analyze()">
     <button id="go" onclick="analyze()">分析</button>
     <span id="status" class="status"></span>
   </div>
   <div class="err" id="err"></div>
-  <div class="hint">美股用字母（NVDA），A股用6位数字（600519），港股加HK（HK00700）。多只用逗号分隔。<b>可选：在代码后加 <code>@成本价</code> 标注当前持仓</b>，例如 <code>NVDA@200</code>，会显示浮动盈亏并给持仓建议。</div>
+  <div class="hint">仅支持美股 ticker（1–5 个英文字母，如 <code>NVDA</code>、<code>RDW</code>、<code>RKLB</code>）。多只用逗号分隔。<b>可选：在代码后加 <code>@成本价</code> 标注当前持仓</b>，例如 <code>NVDA@200</code>，会显示浮动盈亏并给持仓建议。</div>
   <div id="history" class="histbar"></div>
   <div class="arbar">
     <label class="switch"><input type="checkbox" id="arToggle" onchange="toggleAuto()"><span class="slider"></span></label>
@@ -269,6 +315,8 @@ const charts={};
 const fmt=(n,d=2)=>{if(n===null||n===undefined||isNaN(n))return '—';const a=Math.abs(n);
  if(a>=1000)return Number(n).toLocaleString('en-US',{maximumFractionDigits:0});return Number(n).toFixed(d);};
 const pct=n=>(n>0?'+':'')+fmt(n,2)+'%';const up=n=>n>=0;
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const safeHref=u=>/^https?:\/\//i.test(String(u||''))?String(u):'';
 const SIG={strong_buy:{t:'强烈买入',c:'green'},buy:{t:'买入',c:'green'},hold:{t:'持有',c:'amber'},
  wait:{t:'观望',c:'gray'},sell:{t:'卖出',c:'red'},strong_sell:{t:'强烈卖出',c:'red'}};
 const COL={green:['var(--green)','var(--green-bg)'],red:['var(--red)','var(--red-bg)'],
@@ -294,6 +342,36 @@ function buildOpinion(s){
    flags.push(['财报 '+ed.days+'天后','amber']);
    if(ed.days<=5){earnSoon=true; if(sig==='strong_buy'||sig==='buy')sig='hold';}
  }
+ // 新闻面：技术信号是底座，负面/高波动新闻会降低操作激进度
+ const ns=s.news_sentiment||{};
+ if(ns.tone==='negative'){
+   flags.push(['消息偏负','red']);
+   if(sig==='strong_buy'||sig==='buy')sig='wait';
+   else if(sig==='hold')sig='wait';
+ }else if(ns.tone==='mixed'){
+   flags.push(['消息多空交织','amber']);
+   if(sig==='strong_buy'||sig==='buy')sig='hold';
+ }else if(ns.tone==='positive'){
+   flags.push(['消息偏正','green']);
+ }
+ if(ns.risk_count>0){
+   flags.push(['新闻高波动 '+ns.risk_count,'amber']);
+   if(sig==='strong_buy')sig='buy';
+   else if(sig==='buy'&&ns.risk_count>=2)sig='hold';
+ }
+ // 相对强弱：个股跑赢/跑输 SPY 和 QQQ 会影响技术信号可信度
+ const rs=s.relative_strength||{}, rsum=rs.summary||{};
+ if(rsum.label_cn&&rsum.market!=='unknown'){
+   const bothStrong=rsum.market==='outperform'&&rsum.tech==='outperform';
+   const bothWeak=rsum.market==='underperform'&&rsum.tech==='underperform';
+   flags.push([rsum.label_cn,bothStrong?'green':bothWeak?'red':'amber']);
+   if(bothWeak){
+     if(sig==='strong_buy')sig='hold';
+     else if(sig==='buy')sig='wait';
+   }else if(rsum.tech==='underperform'&&(sig==='strong_buy'||sig==='buy')){
+     sig='hold';
+   }
+ }
  const atr=(ind.atr||{}).atr;
  const lows=(s.recent_bars||[]).map(b=>b.low).filter(x=>x);const recentLow=lows.length?Math.min.apply(null,lows):null;
  const supports=[ma.MA10,ma.MA60,ma.MA20].filter(x=>x&&x<price).sort((a,b)=>b-a);
@@ -307,7 +385,9 @@ function buildOpinion(s){
  else if(sig==='wait')verb='暂时观望，等企稳信号（缩量+站回均线）再说';
  else verb='趋势走弱，不宜接刀，反弹看作减仓机会';
  if(earnSoon)verb+='；⚠️ 财报临近（'+ed.days+'天），波动大，建议轻仓或等财报后';
- return {sig,meta,flags,price,buyZone,stop,target,verb,atr,wk,ed};
+ if(ns.summary_cn&&ns.tone!=='none')verb+='；'+ns.summary_cn;
+ if(rsum.label_cn&&rsum.market!=='unknown')verb+='；相对强弱：'+rsum.label_cn+'。';
+ return {sig,meta,flags,price,buyZone,stop,target,verb,atr,wk,ed,ns,rs};
 }
 function posNote(o,cost){
  if(!cost)return '';
@@ -336,6 +416,10 @@ function render(data){
   const o=ops[i],r=s.realtime||{},ind=s.indicators||{},ma=ind.ma||{},rsi=ind.rsi||{},macd=ind.macd||{},vol=ind.volume||{},bias=ind.bias||{};
   const sc=s.trend_score||{};const c0=COL[o.meta.c];const fg=c0[0],bg=c0[1];
   const chg=r.change_pct;const cc=up(chg)?'var(--green)':'var(--red)';
+  const rs=s.relative_strength||{},rsum=rs.summary||{},rs20=(rs.periods||{})['20d']||{};
+  const rsCol=(rsum.market==='outperform'&&rsum.tech==='outperform')?'var(--green)':(rsum.market==='underperform'&&rsum.tech==='underperform')?'var(--red)':'inherit';
+  const rsParts=[rs20.vs_spy!=null?'SPY '+pct(rs20.vs_spy):'',rs20.vs_qqq!=null?'QQQ '+pct(rs20.vs_qqq):''].filter(Boolean);
+  const rsTxt=rsParts.length?(rsum.label_cn+' · '+rsParts.join(' / ')):'—';
   const cost=POS[s.code];const pnl=cost?((o.price-cost)/cost*100):null;
   const pnc=pnl>=0?'var(--green)':'var(--red)';
   const holdHtml=cost?('<div style="font-size:11.5px;color:var(--sub);margin-top:-4px">📍 持仓成本 $'+fmt(cost)+' · 浮动 <b style="color:'+pnc+'">'+pct(pnl)+'</b></div>'):'';
@@ -357,6 +441,7 @@ function render(data){
    +'<div class="kv"><div class="k">RSI(12)</div><div class="v">'+fmt(rsi.RSI12,1)+' <span style="font-weight:400;color:var(--sub)">'+(zoneMap[rsi.zone]||'')+'</span></div></div>'
    +'<div class="kv"><div class="k">量能</div><div class="v">'+(volMap[vol.trend]||'—')+' '+(vol.vol_ratio?'('+fmt(vol.vol_ratio,2)+'x)':'')+'</div></div>'
    +'<div class="kv"><div class="k">乖离(MA5)</div><div class="v" style="color:'+(bias.bias_ma5>=5?'var(--red)':'inherit')+'">'+fmt(bias.bias_ma5,2)+'%</div></div>'
+   +'<div class="kv"><div class="k">相对强弱(20D)</div><div class="v" style="font-size:11.5px;color:'+rsCol+'">'+rsTxt+'</div></div>'
    +'<div class="kv"><div class="k">52周区间</div><div class="v" style="font-size:11.5px">'+fmt(r.week_52_low)+' – '+fmt(r.week_52_high)+'</div></div>'
    +'</div>'
    +'<div class="op"><h4>操作参考</h4><div class="levels">'
@@ -617,7 +702,7 @@ async function openDetail(code,name,silent){
   if(A){const i=A.stocks.findIndex(x=>x.code===code);
     if(i>=0){const o=A.ops[i],s=A.stocks[i];
       lv={buy:o.buyZone,stop:o.stop,target:o.target,cost:A.pos[code]};
-      ctx={weekly:s.weekly,atr:(s.indicators||{}).atr,earnings:s.earnings,news:s.news,score:s.trend_score,sigMeta:o.meta};}}
+      ctx={weekly:s.weekly,atr:(s.indicators||{}).atr,earnings:s.earnings,news:s.news,newsSentiment:s.news_sentiment,relativeStrength:s.relative_strength,score:s.trend_score,sigMeta:o.meta};}}
   renderDetail(d,lv,ctx);
  }catch(e){ document.getElementById('mbody').innerHTML='<div class="loading" style="color:var(--red)">加载失败：'+e.message+'</div>'; }
 }
@@ -625,16 +710,28 @@ async function openDetail(code,name,silent){
 function ctxBlock(ctx){
  if(!ctx)return '';
  const wkMap={bullish:'多头',strong_bullish:'强多头',weak_bullish:'弱多头',bearish:'空头',strong_bearish:'强空头',weak_bearish:'弱空头',consolidation:'震荡',insufficient_data:'数据不足',unknown:'—'};
- const wk=ctx.weekly||{}, atr=ctx.atr||{}, ed=ctx.earnings;
+ const wk=ctx.weekly||{}, atr=ctx.atr||{}, ed=ctx.earnings, ns=ctx.newsSentiment||{}, rs=ctx.relativeStrength||{}, rsum=rs.summary||{};
  let chips='';
  if(ctx.sigMeta)chips+='<span class="pill" style="border-color:'+COL[ctx.sigMeta.c][0]+';color:'+COL[ctx.sigMeta.c][0]+'">综合 '+ctx.sigMeta.t+(ctx.score?' · '+ctx.score.total+'分':'')+'</span>';
  if(wk.trend)chips+='<span class="pill">周线 '+(wkMap[wk.trend]||wk.trend)+'</span>';
  if(atr.atr_pct!=null)chips+='<span class="pill">ATR波动 '+fmt(atr.atr_pct,1)+'%</span>';
  if(ed&&ed.days!=null)chips+='<span class="pill" style="border-color:var(--amber);color:var(--amber)">📅 财报 '+(ed.days>=0?ed.days+'天后':'已发布')+'（'+ed.date+'）</span>';
+ if(ns.tone&&ns.tone!=='none'){
+   const nc=ns.tone==='positive'?'green':ns.tone==='negative'?'red':ns.tone==='mixed'?'amber':'gray';
+   chips+='<span class="pill" style="border-color:'+COL[nc][0]+';color:'+COL[nc][0]+'">新闻面 '+(ns.tone==='positive'?'偏正':ns.tone==='negative'?'偏负':ns.tone==='mixed'?'多空交织':'中性')+'</span>';
+ }
+ if(rsum.label_cn&&rsum.market!=='unknown'){
+   const rc=rsum.market==='outperform'&&rsum.tech==='outperform'?'green':rsum.market==='underperform'&&rsum.tech==='underperform'?'red':'amber';
+   chips+='<span class="pill" style="border-color:'+COL[rc][0]+';color:'+COL[rc][0]+'">相对强弱 '+rsum.label_cn+'</span>';
+ }
  let news='';
+ if(ns.summary_cn&&ns.tone!=='none'){
+   news+='<div style="font-size:12.5px;line-height:1.5;margin:4px 0 10px;color:var(--sub)"><b style="color:var(--ink)">新闻解读：</b>'+ns.summary_cn+'</div>';
+ }
  if(ctx.news&&ctx.news.length){
-   news='<div style="margin-top:12px"><div style="font-size:12px;color:var(--sub);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">📰 最新消息</div>'
-     +ctx.news.slice(0,4).map(n=>'<div style="font-size:12.5px;margin-bottom:5px;line-height:1.45">• '+(n.url?'<a href="'+n.url+'" target="_blank" style="color:var(--blue);text-decoration:none">'+n.title+'</a>':n.title)+(n.publisher?' <span style="color:var(--sub)">— '+n.publisher+'</span>':'')+'</div>').join('')+'</div>';
+   news+='<div style="margin-top:12px"><div style="font-size:12px;color:var(--sub);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">📰 最新消息</div>'
+     +ctx.news.slice(0,4).map(n=>{const u=safeHref(n.url),title=esc(n.title),pub=esc(n.publisher);
+       return '<div style="font-size:12.5px;margin-bottom:5px;line-height:1.45">• '+(u?'<a href="'+esc(u)+'" target="_blank" rel="noopener noreferrer" style="color:var(--blue);text-decoration:none">'+title+'</a>':title)+(pub?' <span style="color:var(--sub)">— '+pub+'</span>':'')+'</div>';}).join('')+'</div>';
  }
  if(!chips&&!news)return '';
  return '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 12px">'+chips+'</div>'+news;
@@ -704,27 +801,31 @@ function drawCandle(d,lv){
  const body=bars.map(b=>[Math.min(b.o,b.c),Math.max(b.o,b.c)]);
  const vwap=bars.map(b=>b.vwap);
  // 动态 Y 轴：贴着当日真实价格区间，留少量边距
- let lo=Math.min.apply(null,bars.map(b=>b.l));
- let hi=Math.max.apply(null,bars.map(b=>b.h));
- // 把贴近现价的策略位/昨收纳入 Y 轴（避免画在框外）
- [d.prev_close,lv.buy,lv.stop,lv.cost].forEach(v=>{if(v){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
- // 目标价通常较远：仅当离现价不太远(±12%)时才纳入坐标，否则只在卡片里显示数值
- if(lv.target && lv.target<=hi*1.12 && lv.target>=lo*0.88){lo=Math.min(lo,lv.target);hi=Math.max(hi,lv.target);}
+ const dayLo=Math.min.apply(null,bars.map(b=>b.l));
+ const dayHi=Math.max.apply(null,bars.map(b=>b.h));
+ const dayRange=Math.max(dayHi-dayLo,d.last*0.004,0.01);
+ const includePad=Math.max(dayRange*1.6,d.last*0.012);
+ let lo=dayLo, hi=dayHi;
+ // 只把贴近日内价格的线纳入 Y 轴；远离现价的策略位留在下方点位卡，避免 K 线被压扁。
+ function lineInView(v){
+   return !!v && v>=dayLo-includePad && v<=dayHi+includePad;
+ }
+ [d.prev_close,lv.buy,lv.stop,lv.cost,lv.target].forEach(v=>{if(lineInView(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
  const pad=(hi-lo)*0.10 || hi*0.01;
  const ymin=lo-pad, ymax=hi+pad;
  // 市场参考线（虚线）
  const flat=(v,col,label,dash)=>({type:'line',label:label,data:labels.map(()=>v),borderColor:col,borderWidth:1.2,borderDash:dash||[3,3],pointRadius:0,fill:false,order:0});
  const refs=[];
- if(d.prev_close) refs.push(flat(d.prev_close,'#868e96','昨收'));
+ if(lineInView(d.prev_close)) refs.push(flat(d.prev_close,'#868e96','昨收'));
  refs.push(flat(d.open,'#f08c00','开盘'));
  refs.push(flat(d.high,'rgba(12,166,120,.5)','日内高'));
  refs.push(flat(d.low,'rgba(224,49,49,.5)','日内低'));
  // 策略线（实线，更醒目）
  const strat=(v,col,label)=>({type:'line',label:label,data:labels.map(()=>v),borderColor:col,borderWidth:1.6,pointRadius:0,fill:false,order:0});
- if(lv.cost) refs.push(strat(lv.cost,'#5f3dc4','成本'));
- if(lv.buy) refs.push(strat(lv.buy,'#2f9e44','买点'));
- if(lv.stop) refs.push(strat(lv.stop,'#e03131','止损'));
- if(lv.target && lv.target<=ymax && lv.target>=ymin) refs.push(strat(lv.target,'#1098ad','目标'));
+ if(lineInView(lv.cost)) refs.push(strat(lv.cost,'#5f3dc4','成本'));
+ if(lineInView(lv.buy)) refs.push(strat(lv.buy,'#2f9e44','买点'));
+ if(lineInView(lv.stop)) refs.push(strat(lv.stop,'#e03131','止损'));
+ if(lineInView(lv.target)) refs.push(strat(lv.target,'#1098ad','目标'));
  if(detailChart)detailChart.destroy();
  detailChart=new Chart(document.getElementById('bigc'),{
   data:{labels,datasets:[
@@ -803,19 +904,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"fatal": "未提供股票代码"}))
             if not os.path.exists(FETCHER):
                 return self._send(200, json.dumps({"fatal": "找不到 stock_data_fetcher.py（需与本文件同目录）"}))
-            codes = [c.strip().upper() for c in stocks.split(",") if c.strip()]
+            codes, input_errors = split_us_tickers(stocks)
+            if not codes:
+                return self._send(200, json.dumps(_analysis_error_response(input_errors), ensure_ascii=False))
             # 优先走进程内引擎（快 + 带缓存/并发）；导入失败才回退子进程
             if FETCHER_MOD is not None:
                 try:
-                    return self._send(200, json.dumps(analyze_codes(codes), ensure_ascii=False))
+                    data = _merge_input_errors(analyze_codes(codes), input_errors)
+                    return self._send(200, json.dumps(data, ensure_ascii=False))
                 except Exception as e:
                     return self._send(200, json.dumps({"fatal": str(e)}))
             try:
-                out = subprocess.run([sys.executable, FETCHER, "--stocks", stocks, "--days", "120", "--extras"],
+                out = subprocess.run([sys.executable, FETCHER, "--stocks", ",".join(codes), "--days", "120", "--extras"],
                                      capture_output=True, text=True, timeout=120)
                 if out.returncode != 0 and not out.stdout.strip():
                     return self._send(200, json.dumps({"fatal": (out.stderr or "脚本执行失败")[-400:]}))
-                return self._send(200, out.stdout)
+                data = _merge_input_errors(json.loads(out.stdout), input_errors)
+                return self._send(200, json.dumps(data, ensure_ascii=False))
             except subprocess.TimeoutExpired:
                 return self._send(200, json.dumps({"fatal": "脚本执行超时（120s）"}))
             except Exception as e:
@@ -825,6 +930,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = qs.get("stock", [""])[0].strip().upper()
             if not code:
                 return self._send(200, json.dumps({"error": "未提供股票代码"}))
+            if not is_simple_us_ticker(code):
+                return self._send(200, json.dumps({"error": US_ONLY_ERROR}, ensure_ascii=False))
             try:
                 return self._send(200, json.dumps(fetch_intraday(code), ensure_ascii=False))
             except Exception as e:
@@ -834,6 +941,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = qs.get("stock", [""])[0].strip().upper()
             if not code or BT_MOD is None or FETCHER_MOD is None:
                 return self._send(200, json.dumps({"error": "回测引擎不可用或未提供代码"}))
+            if not is_simple_us_ticker(code):
+                return self._send(200, json.dumps({"error": US_ONLY_ERROR}, ensure_ascii=False))
             try:
                 days = int(qs.get("days", ["400"])[0])
                 fee = float(qs.get("fee_bps", ["5"])[0])
@@ -849,6 +958,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = qs.get("stock", [""])[0].strip().upper()
             if not code or BT_MOD is None or FETCHER_MOD is None:
                 return self._send(200, json.dumps({"error": "回测引擎不可用或未提供代码"}))
+            if not is_simple_us_ticker(code):
+                return self._send(200, json.dumps({"error": US_ONLY_ERROR}, ensure_ascii=False))
             try:
                 train = int(qs.get("train", ["180"])[0])
                 test = int(qs.get("test", ["60"])[0])
