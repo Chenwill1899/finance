@@ -1,0 +1,60 @@
+- generic [ref=e2]:
+  - complementary [ref=e3]:
+    - generic [ref=e4]:
+      - heading "单股票 ORB 量化模拟器" [level=1] [ref=e5]
+      - paragraph [ref=e6]: 每次只观察一只股票。输入 ticker，点击运行，系统会拉 5 分钟数据、生成 ORB 信号，并给出模拟操作提醒。
+    - generic [ref=e7]:
+      - generic [ref=e8]:
+        - text: 股票代码
+        - textbox "股票代码" [ref=e9]: MRVL
+      - generic [ref=e10]:
+        - text: 模拟日期
+        - textbox "模拟日期" [ref=e11]: 2026-06-02
+      - generic [ref=e12]:
+        - generic [ref=e13]:
+          - text: 初始资金
+          - spinbutton "初始资金" [ref=e14]: "1000"
+        - generic [ref=e15]:
+          - text: 每边手续费
+          - spinbutton "每边手续费" [ref=e16]: "1.90"
+      - generic [ref=e17]:
+        - text: 数据源
+        - combobox "数据源" [ref=e18]:
+          - option "yfinance 5分钟数据" [selected]
+          - option "本地缓存"
+      - generic [ref=e19]:
+        - checkbox "允许模拟做空" [ref=e20]
+        - text: 允许模拟做空
+      - button "运行单股票模拟" [ref=e21] [cursor=pointer]
+      - generic [ref=e22]: 准备就绪。默认会模拟 MRVL 在 2026-06-02 的 ORB 策略。
+    - generic [ref=e23]: 这是研究和 paper-trading 前置工具，不会自动下单。提醒内容来自规则策略和历史/延迟数据，不是收益保证。
+  - main [ref=e24]:
+    - region "模拟摘要" [ref=e25]:
+      - generic [ref=e26]:
+        - generic [ref=e27]: 最终资金
+        - strong [ref=e28]: $--
+      - generic [ref=e29]:
+        - generic [ref=e30]: 净收益
+        - strong [ref=e31]: $--
+      - generic [ref=e32]:
+        - generic [ref=e33]: 收益率
+        - strong [ref=e34]: "--%"
+      - generic [ref=e35]:
+        - generic [ref=e36]: 交易数
+        - strong [ref=e37]: "--"
+      - generic [ref=e38]:
+        - generic [ref=e39]: 手续费
+        - strong [ref=e40]: $--
+    - generic [ref=e41]:
+      - generic [ref=e42]:
+        - heading "资金变化" [level=2] [ref=e43]
+        - paragraph [ref=e44]: 运行后显示初始资金到每次交易后的变化。
+        - img "资金曲线" [ref=e45]
+      - generic [ref=e46]:
+        - heading "模拟操作提醒" [level=2] [ref=e47]
+        - generic [ref=e49]: 还没有运行模拟。
+    - heading "交易明细" [level=2] [ref=e51]
+    - generic [ref=e52]:
+      - heading "数据与策略" [level=2] [ref=e53]
+      - generic [ref=e54]: 运行后显示数据区间、K 线数量、信号数量和策略参数。
+    - paragraph [ref=e55]: ORB 参数：9:30-9:50 ET 开盘区间，10:00-11:30 ET 监控突破，相对成交量阈值 1.2，止盈 0.75 倍区间，止损 0.5 倍区间。

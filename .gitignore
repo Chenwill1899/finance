@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 数据/缓存输出
+result.json
+*.log
+.DS_Store
+
+# 本地密钥（如以后接 Finnhub/Tiingo 等）
+.env
+config_local.py

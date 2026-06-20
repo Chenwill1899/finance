@@ -1,0 +1,7 @@
+# 美股分析 App 依赖
+# 安装： pip3 install -r requirements.txt --break-system-packages
+yfinance>=0.2.40
+pandas>=2.0
+# 可选（A股/港股增强数据源）：
+# akshare
+# efinance
