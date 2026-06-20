@@ -13,3 +13,6 @@ result.json
 # 本地密钥（如以后接 Finnhub/Tiingo 等）
 .env
 config_local.py
+
+# 杂项
+.playwright-mcp/
