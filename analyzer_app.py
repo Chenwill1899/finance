@@ -31,6 +31,27 @@ try:
 except Exception as _e:
     print(f"⚠️  无法导入 fetcher 模块（将回退到子进程模式）：{_e}")
 
+# 回测引擎（网页内回测用）
+BT_MOD = None
+try:
+    _bspec = importlib.util.spec_from_file_location("backtest_engine", os.path.join(HERE, "backtest_engine.py"))
+    BT_MOD = importlib.util.module_from_spec(_bspec)
+    _bspec.loader.exec_module(BT_MOD)
+except Exception as _e:
+    print(f"⚠️  无法导入回测引擎：{_e}")
+
+
+def _fetch_ohlcv(code, days):
+    """按市场拉取日线（给回测用）。"""
+    market, norm, _ = FETCHER_MOD.classify_stock(code)
+    if market == "us":
+        return FETCHER_MOD.fetch_us(norm, days)["ohlcv"]
+    if market == "cn_a":
+        return FETCHER_MOD.fetch_cn_a(norm, days)["ohlcv"]
+    if market == "cn_hk":
+        return FETCHER_MOD.fetch_hk(norm, days)["ohlcv"]
+    raise ValueError(f"无法识别代码：{code}")
+
 _CACHE = {}             # code -> (timestamp, result_dict)
 _CACHE_LOCK = threading.Lock()
 
@@ -179,6 +200,13 @@ button.ghost,.close,.histclear{background:rgba(255,255,255,.62)!important;color:
 .live{display:inline-flex;align-items:center;gap:5px;color:var(--green);font-weight:600}
 .live .dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 1.4s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.more{display:flex;gap:10px;align-items:center;justify-content:center}
+.btbtn{cursor:pointer;border:1px solid var(--glass-brd);background:rgba(255,255,255,.6);color:var(--blue);border-radius:8px;padding:3px 11px;font-size:11px;font-weight:600;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.btbtn:hover{border-color:var(--blue)}
+.btctrl{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+.btctrl .f{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--sub)}
+.btctrl input{width:90px;border:1px solid var(--glass-brd);background:rgba(255,255,255,.6);border-radius:9px;padding:7px 9px;font:inherit;font-size:13px;color:var(--ink)}
+.bigchart2{height:240px;position:relative;margin:4px 0 14px}
 </style></head><body><div class="wrap">
 <h1>📈 美股智能分析看板</h1>
 <p class="lede">输入股票代码，点「分析」——自动跑脚本、画图、算指标、给买卖意见。数据来自 Yahoo Finance 实时拉取。</p>
@@ -223,6 +251,16 @@ button.ghost,.close,.histclear{background:rgba(255,255,255,.62)!important;color:
     </div>
     <div class="mdate" id="mdate"></div>
     <div id="mbody"><div class="loading">正在拉取当日分时数据…</div></div>
+  </div>
+</div>
+
+<div class="mask" id="btmask" onclick="if(event.target===this)closeBT()">
+  <div class="modal">
+    <div class="mhead">
+      <div><div class="tk" id="bttk"></div><div class="nm">📉 策略回测 · 技术评分规则（无前视偏差·含费用·ATR止损）</div></div>
+      <button class="close" onclick="closeBT()">✕</button>
+    </div>
+    <div id="btbody"><div class="loading">回测计算中…</div></div>
   </div>
 </div>
 
@@ -327,7 +365,8 @@ function render(data){
    +'<div class="lv"><div class="lk">目标</div><div class="lvv" style="color:var(--blue)">$'+fmt(o.target)+'</div></div></div>'
    +'<div>'+o.flags.map(f=>'<span class="tag" style="color:'+COL[f[1]][0]+';background:'+COL[f[1]][1]+'">'+f[0]+'</span>').join('')+'</div>'
    +'<div class="txt">'+o.verb+'。'+(pNote?' '+pNote:'')+'</div></div>'
-   +'<div class="more">🔍 点击查看当日K线分析</div>';
+   +'<div class="more"><span>🔍 当日K线</span>'
+   +'<button class="btbtn" onclick="event.stopPropagation();openBacktest(\''+s.code+'\',\''+(s.name||'').replace(/\x27/g,"")+'\')">📉 回测</button></div>';
   card.onclick=()=>openDetail(s.code,s.name||'');
   cardsEl.appendChild(card);
   const bars=s.recent_bars||[];const labels=bars.map(b=>(b.date||'').slice(5));const closes=bars.map(b=>b.close);
@@ -431,6 +470,128 @@ function renderHistory(){
   + '<button class="histclear" onclick="clearHistory()">清空</button>';
 }
 renderHistory();
+
+// ---------- 网页内回测 ----------
+let btChart=null;
+function closeBT(){ document.getElementById('btmask').classList.remove('on'); if(btChart){btChart.destroy();btChart=null;} }
+async function openBacktest(code,name,params){
+ const mask=document.getElementById('btmask'); mask.classList.add('on');
+ window._btCode=code;
+ document.getElementById('bttk').textContent=code+(name?' · '+name:'');
+ document.getElementById('btbody').innerHTML='<div class="loading">回测计算中…（拉取历史+逐日模拟，约 5–15 秒）</div>';
+ const p=params||window._btParams||{days:400,fee_bps:5,stop_atr:2};
+ window._btParams=p;
+ try{
+  const q='/api/backtest?stock='+encodeURIComponent(code)+'&days='+p.days+'&fee_bps='+p.fee_bps+'&stop_atr='+p.stop_atr;
+  const m=await (await fetch(q)).json();
+  if(m.error){ document.getElementById('btbody').innerHTML='<div class="loading" style="color:var(--red)">'+m.error+'</div>'; return; }
+  renderBacktest(m,p);
+ }catch(e){ document.getElementById('btbody').innerHTML='<div class="loading" style="color:var(--red)">回测失败：'+e.message+'</div>'; }
+}
+function rerunBT(){
+ const p={days:parseInt(document.getElementById('btDays').value,10)||400,
+   fee_bps:parseFloat(document.getElementById('btFee').value)||5,
+   stop_atr:parseFloat(document.getElementById('btStop').value)||2};
+ openBacktest(window._btCode,'',p);
+}
+function renderBacktest(m,p){
+ const pc=x=>(x*100>=0?'+':'')+(x*100).toFixed(1)+'%';
+ const pcn=x=>(x*100).toFixed(1)+'%';
+ const win=m.excess_vs_bh>0; const vc=win?'var(--green)':'var(--red)';
+ const kv=(k,v,col)=>'<div class="kv"><div class="k">'+k+'</div><div class="v"'+(col?' style="color:'+col+'"':'')+'>'+v+'</div></div>';
+ document.getElementById('btbody').innerHTML=
+   '<div class="btctrl">'
+   +'<div class="f">回测交易日<input id="btDays" type="number" value="'+p.days+'"></div>'
+   +'<div class="f">费用(基点/单边)<input id="btFee" type="number" value="'+p.fee_bps+'"></div>'
+   +'<div class="f">ATR止损倍数<input id="btStop" type="number" step="0.5" value="'+p.stop_atr+'"></div>'
+   +'<button onclick="rerunBT()">重新回测</button>'
+   +'<button class="ghost" onclick="openWF(window._btCode)">🔬 走动验证</button></div>'
+   +'<div class="bigchart2"><canvas id="btc"></canvas></div>'
+   +'<div style="display:flex;gap:14px;font-size:11px;color:var(--sub);margin:-6px 0 12px"><span><span style="color:#2f7ad6">—</span> 策略</span><span><span style="color:#adb5bd">—</span> 买入持有</span></div>'
+   +'<div class="stat6">'
+   +kv('策略总收益',pc(m.total_return),vc)
+   +kv('年化',pc(m.cagr),m.cagr>=0?'var(--green)':'var(--red)')
+   +kv('买入持有',pc(m.buy_hold_return))
+   +kv('超额',pc(m.excess_vs_bh)+(win?' ✅':' ❌'),vc)
+   +kv('夏普比率',m.sharpe)
+   +kv('最大回撤',pcn(m.max_drawdown),'var(--red)')
+   +kv('交易次数',m.n_trades)
+   +kv('胜率 / 盈亏比',pcn(m.win_rate)+' / '+m.profit_factor)
+   +'</div>'
+   +'<div class="mverdict">'+(win
+     ? '<b style="color:var(--green)">✅ 这套规则在该标的上跑赢买入持有。</b>但样本内表现≠未来，建议再做 walk-forward 验证（见路线图）。'
+     : '<b style="color:var(--red)">❌ 该标的上规则跑输买入持有。</b>说明此票更适合长持，或规则需针对性优化——这正是回测的价值：用数据说话。')
+   +'</div>';
+ // 资金曲线
+ const labels=(m.dates||[]).map(d=>(d||'').slice(5));
+ if(btChart)btChart.destroy();
+ btChart=new Chart(document.getElementById('btc'),{type:'line',
+  data:{labels,datasets:[
+   {label:'策略',data:m.curve,borderColor:'#2f7ad6',backgroundColor:'rgba(47,122,214,.10)',borderWidth:2,pointRadius:0,tension:.15,fill:true},
+   {label:'买入持有',data:m.bh_curve,borderColor:'#adb5bd',borderWidth:1.5,borderDash:[5,4],pointRadius:0,tension:.15,fill:false}
+  ]},
+  options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+   plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.dataset.label+' '+((c.parsed.y-1)*100).toFixed(1)+'%'}}},
+   scales:{x:{ticks:{font:{size:9},maxTicksLimit:6},grid:{display:false}},
+           y:{ticks:{font:{size:10},callback:v=>((v-1)*100).toFixed(0)+'%'},grid:{color:'#f0f2f6'}}}}});
+}
+async function openWF(code,params){
+ document.getElementById('btbody').innerHTML='<div class="loading">走动验证中…（多窗口训练+样本外检验，约 15–40 秒）</div>';
+ const p=params||window._wfParams||{train:180,test:60,fee_bps:5};
+ window._wfParams=p;
+ try{
+  const q='/api/walkforward?stock='+encodeURIComponent(code)+'&train='+p.train+'&test='+p.test+'&fee_bps='+p.fee_bps;
+  const m=await (await fetch(q)).json();
+  if(m.error){ document.getElementById('btbody').innerHTML='<div class="loading" style="color:var(--red)">'+m.error+'</div><div style="text-align:center"><button class="ghost" onclick="openBacktest(window._btCode)">← 返回回测</button></div>'; return; }
+  renderWF(m,p);
+ }catch(e){ document.getElementById('btbody').innerHTML='<div class="loading" style="color:var(--red)">失败：'+e.message+'</div>'; }
+}
+function rerunWF(){
+ const p={train:parseInt(document.getElementById('wfTrain').value,10)||180,
+   test:parseInt(document.getElementById('wfTest').value,10)||60,
+   fee_bps:parseFloat(document.getElementById('wfFee').value)||5};
+ openWF(window._btCode,p);
+}
+function renderWF(m,p){
+ const pc=x=>(x*100>=0?'+':'')+(x*100).toFixed(1)+'%';
+ const pcn=x=>(x*100).toFixed(1)+'%';
+ const win=m.oos_excess_vs_bh>0; const vc=win?'var(--green)':'var(--red)';
+ const overfit=m.overfit_gap>0.15;
+ const kv=(k,v,col)=>'<div class="kv"><div class="k">'+k+'</div><div class="v"'+(col?' style="color:'+col+'"':'')+'>'+v+'</div></div>';
+ document.getElementById('btbody').innerHTML=
+   '<div class="btctrl">'
+   +'<div class="f">训练窗口(日)<input id="wfTrain" type="number" value="'+p.train+'"></div>'
+   +'<div class="f">测试窗口(日)<input id="wfTest" type="number" value="'+p.test+'"></div>'
+   +'<div class="f">费用(基点)<input id="wfFee" type="number" value="'+p.fee_bps+'"></div>'
+   +'<button onclick="rerunWF()">重跑</button>'
+   +'<button class="ghost" onclick="openBacktest(window._btCode)">← 返回回测</button></div>'
+   +'<div style="font-size:12px;color:var(--sub);margin-bottom:8px">🔬 <b>'+m.n_folds+'</b> 段滚动窗口，每段「训练区调参→测试区检验」，下图与指标<b>只统计样本外(OOS)</b>——这才是防过拟合后的真实成色。</div>'
+   +'<div class="bigchart2"><canvas id="wfc"></canvas></div>'
+   +'<div style="display:flex;gap:14px;font-size:11px;color:var(--sub);margin:-6px 0 12px"><span><span style="color:#7048e8">—</span> 样本外策略</span></div>'
+   +'<div class="stat6">'
+   +kv('样本外收益',pc(m.oos_total_return),vc)
+   +kv('样本外年化',pc(m.oos_cagr),m.oos_cagr>=0?'var(--green)':'var(--red)')
+   +kv('同期买入持有',pc(m.oos_buy_hold))
+   +kv('超额',pc(m.oos_excess_vs_bh)+(win?' ✅':' ❌'),vc)
+   +kv('样本外夏普',m.oos_sharpe)
+   +kv('最大回撤',pcn(m.oos_max_drawdown),'var(--red)')
+   +kv('窗口段数',m.n_folds)
+   +kv('过拟合落差',pc(m.overfit_gap),overfit?'var(--red)':'var(--green)')
+   +'</div>'
+   +'<div class="mverdict">'+(overfit
+     ? '<b style="color:var(--red)">⚠️ 过拟合落差较大</b>：样本内表现明显好于样本外，说明参数在迎合历史噪声，实盘需谨慎。'
+     : '<b style="color:var(--green)">✅ 过拟合落差可接受</b>：样本外表现与样本内接近，规则相对稳健。')
+   +(win?'　且样本外仍跑赢买入持有。':'　但样本外跑输买入持有，该票或不适合此策略。')+'</div>';
+ const labels=(m.dates||[]).map(d=>(d||'').slice(5));
+ if(btChart)btChart.destroy();
+ btChart=new Chart(document.getElementById('wfc'),{type:'line',
+  data:{labels,datasets:[{label:'样本外策略',data:m.curve,borderColor:'#7048e8',backgroundColor:'rgba(112,72,232,.10)',borderWidth:2,pointRadius:0,tension:.15,fill:true}]},
+  options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+   plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'样本外 '+((c.parsed.y-1)*100).toFixed(1)+'%'}}},
+   scales:{x:{ticks:{font:{size:9},maxTicksLimit:6},grid:{display:false}},
+           y:{ticks:{font:{size:10},callback:v=>((v-1)*100).toFixed(0)+'%'},grid:{color:'#f0f2f6'}}}}});
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeBT();});
 
 // ---------- 当日 K 线详情 ----------
 let detailChart=null;
@@ -666,6 +827,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"error": "未提供股票代码"}))
             try:
                 return self._send(200, json.dumps(fetch_intraday(code), ensure_ascii=False))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+        if parsed.path == "/api/backtest":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = qs.get("stock", [""])[0].strip().upper()
+            if not code or BT_MOD is None or FETCHER_MOD is None:
+                return self._send(200, json.dumps({"error": "回测引擎不可用或未提供代码"}))
+            try:
+                days = int(qs.get("days", ["400"])[0])
+                fee = float(qs.get("fee_bps", ["5"])[0])
+                stop = float(qs.get("stop_atr", ["2"])[0])
+                ohlcv = _fetch_ohlcv(code, max(days, 120))
+                m = BT_MOD.run_backtest(ohlcv, fee_bps=fee, stop_atr=stop, with_curve=True)
+                m["code"] = code
+                return self._send(200, json.dumps(m, ensure_ascii=False))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+        if parsed.path == "/api/walkforward":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = qs.get("stock", [""])[0].strip().upper()
+            if not code or BT_MOD is None or FETCHER_MOD is None:
+                return self._send(200, json.dumps({"error": "回测引擎不可用或未提供代码"}))
+            try:
+                train = int(qs.get("train", ["180"])[0])
+                test = int(qs.get("test", ["60"])[0])
+                fee = float(qs.get("fee_bps", ["5"])[0])
+                need = 60 + train + test + 10
+                ohlcv = _fetch_ohlcv(code, need)
+                m = BT_MOD.walk_forward(ohlcv, train=train, test=test, fee_bps=fee, with_curve=True)
+                m["code"] = code
+                return self._send(200, json.dumps(m, ensure_ascii=False))
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}))
         self._send(404, json.dumps({"fatal": "not found"}))

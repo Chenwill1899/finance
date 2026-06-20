@@ -8,4 +8,5 @@ command -v proxy_on >/dev/null 2>&1 && proxy_on
 # 首次运行自动装依赖
 python3 -c "import yfinance" 2>/dev/null || pip3 install -r requirements.txt --break-system-packages
 
-python3 analyzer_app.py
+# 统一入口启动网页看板
+python3 run.py
